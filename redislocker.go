@@ -2,6 +2,7 @@ package redislocker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -99,15 +100,16 @@ func (l *redisLock) listen(ctx context.Context, unlockRequests <-chan *redis.Mes
 
 func (l *redisLock) keepAlive(ctx context.Context) {
 	//insures that an extend will be canceled if it's unlocked in the middle of an attempt
-	c := context.WithoutCancel(ctx)
 	for {
 		select {
-		case <-time.After(time.Until(l.mutex.Until()) - time.Second):
-			_, err := l.mutex.ExtendContext(c)
+		case <-time.After(time.Until(l.mutex.Until()) - 4*time.Second):
+			log.Println("attempting to extend lock")
+			_, err := l.mutex.ExtendContext(ctx)
 			if err != nil {
-				log.Fatal(err)
+				log.Fatal("failed to extend lock:", err)
 			}
-		case <-c.Done():
+		case <-ctx.Done():
+			log.Println("lock was closed")
 			return
 		}
 	}
@@ -115,8 +117,9 @@ func (l *redisLock) keepAlive(ctx context.Context) {
 
 func (l *redisLock) Unlock() error {
 	_, err := l.mutex.Unlock()
-	if l.cancel != nil {
-		l.cancel()
+	if l.cancel == nil {
+		return errors.New("something's gone horribly wrong")
 	}
+	l.cancel()
 	return err
 }
