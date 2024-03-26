@@ -2,23 +2,27 @@ package redislocker
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/go-redsync/redsync/v4"
-	"github.com/go-redsync/redsync/v4/redis"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	"github.com/redis/go-redis/v9"
 	"github.com/tus/tusd/v2/pkg/handler"
 )
 
-func New(client redis.Pool) handler.Locker {
-	rs := redsync.New(client)
+func New(client *redis.Client) handler.Locker {
+	rs := redsync.New(goredis.NewPool(client))
 	return &RedisLocker{
-		rs: rs,
+		rs:    rs,
+		redis: client,
 	}
 }
 
 type RedisLocker struct {
-	rs *redsync.Redsync
+	rs    *redsync.Redsync
+	redis *redis.Client
 }
 
 func (locker *RedisLocker) NewLock(id string) (handler.Lock, error) {
@@ -26,6 +30,7 @@ func (locker *RedisLocker) NewLock(id string) (handler.Lock, error) {
 	return &redisLock{
 		id:    id,
 		mutex: mutex,
+		redis: locker.redis,
 	}, nil
 }
 
@@ -35,21 +40,20 @@ type redisLock struct {
 	onRelease func()
 	ctx       context.Context
 	cancel    func()
+	redis     *redis.Client
+}
+
+func (l *redisLock) channelName() string {
+	return fmt.Sprintf("tusd_lock_release_request_%s", l.id)
 }
 
 func (l *redisLock) Lock(ctx context.Context, releaseRequested func()) error {
 	if err := l.lock(ctx); err != nil {
-		//attempt request release
-		// needs to be able to steal a lock while something's trying to extend theirs.. not sure how to do this.
-		select {
-		case <-time.After(100 * time.Millisecond):
-			return l.Lock(ctx, releaseRequested)
-		case <-ctx.Done():
-			// TODO extract real error types
-			return errors.New("Timeout")
+		if err := l.retryLock(ctx); err != nil {
+			return err
 		}
 	}
-
+	l.onRelease = releaseRequested
 	return nil
 }
 
@@ -57,20 +61,60 @@ func (l *redisLock) lock(ctx context.Context) error {
 	if err := l.mutex.TryLockContext(ctx); err != nil {
 		return err
 	}
-	// leave room for something to steal the lock
-	// could rewrite with extend but i'm not sure how something could steal
-	l.ctx, l.cancel = context.WithDeadline(context.Background(), l.mutex.Until().Add(1*time.Second))
-	go func() {
-		<-l.ctx.Done()
-		if err := l.lock(context.TODO()); err != nil {
-			l.onRelease()
-		}
-	}()
+
+	l.ctx, l.cancel = context.WithCancel(context.Background())
+	psub := l.redis.PSubscribe(l.ctx, l.channelName())
+	c := psub.Channel(nil)
+	go l.listen(l.ctx, c)
+	go l.keepAlive(l.ctx)
+
 	return nil
+}
+
+func (l *redisLock) retryLock(ctx context.Context) error {
+	for {
+		//Question how many times should this send a request?
+		//TODO do something with the IntCmd result
+		l.redis.Publish(ctx, l.channelName(), "please release")
+		select {
+		case <-time.After(100 * time.Millisecond):
+			if err := l.lock(ctx); err != nil {
+				continue
+			}
+			return nil
+		case <-ctx.Done():
+			return handler.ErrLockTimeout
+		}
+	}
+}
+
+func (l *redisLock) listen(ctx context.Context, unlockRequests <-chan *redis.Message) {
+	select {
+	case <-unlockRequests:
+		l.onRelease()
+	case <-ctx.Done():
+		return
+	}
+}
+
+func (l *redisLock) keepAlive(ctx context.Context) {
+	//insures that an extend will be canceled if it's unlocked in the middle of an attempt
+	c := context.WithoutCancel(ctx)
+	for {
+		select {
+		case <-time.After(time.Until(l.mutex.Until()) - time.Second):
+			_, err := l.mutex.ExtendContext(c)
+			if err != nil {
+				log.Fatal(err)
+			}
+		case <-c.Done():
+			return
+		}
+	}
 }
 
 func (l *redisLock) Unlock() error {
 	_, err := l.mutex.Unlock()
-	defer l.cancel()
+	l.cancel()
 	return err
 }
