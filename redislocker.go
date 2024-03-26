@@ -64,7 +64,7 @@ func (l *redisLock) lock(ctx context.Context) error {
 
 	l.ctx, l.cancel = context.WithCancel(context.Background())
 	psub := l.redis.PSubscribe(l.ctx, l.channelName())
-	c := psub.Channel(nil)
+	c := psub.Channel()
 	go l.listen(l.ctx, c)
 	go l.keepAlive(l.ctx)
 
@@ -115,6 +115,8 @@ func (l *redisLock) keepAlive(ctx context.Context) {
 
 func (l *redisLock) Unlock() error {
 	_, err := l.mutex.Unlock()
-	l.cancel()
+	if l.cancel != nil {
+		l.cancel()
+	}
 	return err
 }
